@@ -17,8 +17,17 @@ OBJS     = $(SRCS:.c=.o)
 
 # Compiler settings
 CC       = gcc
-CFLAGS   = -Wall -Wextra -g $(shell pkg-config --cflags fuse3)
-LDFLAGS  = $(shell pkg-config --libs fuse3)
+
+# Prefer FUSE2 (macFUSE) on macOS, prefer FUSE3 on Linux/WSL.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+FUSE_PKG := $(shell (pkg-config --exists fuse && echo fuse) || (pkg-config --exists fuse3 && echo fuse3) || echo fuse)
+else
+FUSE_PKG := $(shell (pkg-config --exists fuse3 && echo fuse3) || (pkg-config --exists fuse && echo fuse) || echo fuse3)
+endif
+
+CFLAGS   = -Wall -Wextra -g $(shell pkg-config --cflags $(FUSE_PKG))
+LDFLAGS  = $(shell pkg-config --libs $(FUSE_PKG))
 
 # ---------------------------------------------------------------
 # Default target: build the binary

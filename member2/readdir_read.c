@@ -1,25 +1,29 @@
-#include "mini_unionfs.h"
+#include "../mini_unionfs.h"
 
 /*
  * Member 2: Read operations + directory listing.
  *
- * This file implements:
- *   - unionfs_open(): validate that the file resolves
- *   - unionfs_read(): open + pread() based on resolve_path
- *   - unionfs_readdir(): merge upper and lower directory entries
+ * This file is intentionally self-contained and avoids assumptions about
+ * the rest of the codebase beyond the shared contract in mini_unionfs.h:
+ *   - struct mini_unionfs_state contains lower_dir and upper_dir
+ *   - resolve_path(path, resolved) implements unionfs resolution rules
+ *   - WHITEOUT_PREFIX is the whiteout naming convention (".wh.")
+ *   - UNIONFS_PATH_MAX is a safe path buffer size
  *
- * Merge rules (typical UnionFS/OverlayFS semantics):
- *   - Upper layer entries take precedence over lower layer entries
- *   - Whiteouts in upper hide matching lower entries
- *   - Whiteout marker files themselves (.wh.*) are hidden from directory lists
- *
- * Portability:
- *   - FUSE3 (Linux/WSL): readdir has an extra `flags` argument
- *   - FUSE2 (macFUSE): readdir does not have the flags argument
+ * Portability notes:
+ *   - Linux/WSL typically builds against libfuse3 (FUSE3 API)
+ *   - macOS typically uses macFUSE, which is FUSE 2.x compatible
+ *   - The readdir callback signature differs between FUSE2 and FUSE3.
  */
 
+#if defined(FUSE_MAJOR_VERSION) && (FUSE_MAJOR_VERSION >= 3)
+#define MINI_UNIONFS_FUSE3 1
+#else
+#define MINI_UNIONFS_FUSE3 0
+#endif
+
 /* -------------------------------------------------------------------------
- * Small helper: call filler with the correct arity across FUSE versions.
+ * Small helper: call filler with the right arity across FUSE versions.
  * ------------------------------------------------------------------------- */
 #if MINI_UNIONFS_FUSE3
 static inline int fill_dir(void *buf, fuse_fill_dir_t filler, const char *name)
@@ -34,9 +38,10 @@ static inline int fill_dir(void *buf, fuse_fill_dir_t filler, const char *name)
 #endif
 
 /* -------------------------------------------------------------------------
- * A tiny set implementation for directory entry names.
+ * A tiny "seen names" set.
  *
- * We use a linear-search dynamic array (directories are small in this project).
+ * We keep it intentionally simple (linear search) because directories in
+ * teaching projects are small, and this avoids non-portable hash APIs.
  * ------------------------------------------------------------------------- */
 struct seen_set {
     char **names;
@@ -90,11 +95,22 @@ static int seen_add(struct seen_set *set, const char *name)
     return 0;
 }
 
+/*
+ * Returns 1 if the directory entry should be hidden from the merged view.
+ * We hide the internal whiteout marker files from the user.
+ */
 static int is_internal_whiteout_name(const char *name)
 {
     return (strncmp(name, WHITEOUT_PREFIX, strlen(WHITEOUT_PREFIX)) == 0);
 }
 
+/*
+ * Compute the on-disk path to a possible whiteout marker for a name inside
+ * the directory represented by `path`.
+ *
+ * `path` is the FUSE virtual directory path (e.g. "/", "/etc").
+ * Whiteout should be in the *upper layer* within that directory.
+ */
 static void build_whiteout_path(char out[UNIONFS_PATH_MAX],
                                 const struct mini_unionfs_state *state,
                                 const char *path,
@@ -103,12 +119,16 @@ static void build_whiteout_path(char out[UNIONFS_PATH_MAX],
     char upper_dir_path[UNIONFS_PATH_MAX];
     snprintf(upper_dir_path, UNIONFS_PATH_MAX, "%s%s", state->upper_dir, path);
 
-    /* Always include a '/' separator (double slashes are fine). */
+    /* Always inject a '/' separator; double slashes are harmless. */
     snprintf(out, UNIONFS_PATH_MAX, "%s/%s%s", upper_dir_path, WHITEOUT_PREFIX, name);
 }
 
 /* -------------------------------------------------------------------------
- * unionfs_open
+ * unionfs_open()
+ *
+ * Called when a file is opened. For this mini filesystem we only need to
+ * validate that the path resolves (i.e., exists and isn't whiteout'd).
+ * We don't keep file handles here — read() will open+pread as needed.
  * ------------------------------------------------------------------------- */
 int unionfs_open(const char *path, struct fuse_file_info *fi)
 {
@@ -117,11 +137,15 @@ int unionfs_open(const char *path, struct fuse_file_info *fi)
     char resolved[UNIONFS_PATH_MAX];
     int res = resolve_path(path, resolved);
     if (res != 0) return res;
+
     return 0;
 }
 
 /* -------------------------------------------------------------------------
- * unionfs_read
+ * unionfs_read()
+ *
+ * Called to read file contents.
+ * Must use pread() because FUSE may request reads at arbitrary offsets.
  * ------------------------------------------------------------------------- */
 int unionfs_read(const char *path, char *buf, size_t size, off_t offset,
                  struct fuse_file_info *fi)
@@ -143,7 +167,15 @@ int unionfs_read(const char *path, char *buf, size_t size, off_t offset,
 }
 
 /* -------------------------------------------------------------------------
- * unionfs_readdir
+ * unionfs_readdir()
+ *
+ * Called when listing a directory (e.g. `ls`). We must merge entries from:
+ *   - upper layer directory
+ *   - lower layer directory
+ * with these rules:
+ *   - upper entries take precedence
+ *   - hide any lower entry that has a corresponding whiteout marker in upper
+ *   - do not show internal whiteout files to the user
  * ------------------------------------------------------------------------- */
 #if MINI_UNIONFS_FUSE3
 int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
@@ -162,11 +194,11 @@ int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     struct mini_unionfs_state *state = UNIONFS_DATA;
 
-    /* Always include the standard dot entries. */
+    /* Always add the mandatory dot entries first. */
     if (fill_dir(buf, filler, ".") != 0) return 0;
     if (fill_dir(buf, filler, "..") != 0) return 0;
 
-    /* Build the real directory paths. */
+    /* Build directory paths in both layers. */
     char upper_dir_path[UNIONFS_PATH_MAX];
     char lower_dir_path[UNIONFS_PATH_MAX];
     snprintf(upper_dir_path, UNIONFS_PATH_MAX, "%s%s", state->upper_dir, path);
@@ -175,7 +207,7 @@ int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
     struct seen_set seen;
     seen_init(&seen);
 
-    /* 1) Upper layer entries first. */
+    /* 1) Add entries from upper layer (if directory exists). */
     DIR *dp = opendir(upper_dir_path);
     if (dp != NULL) {
         errno = 0;
@@ -186,6 +218,7 @@ int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
             if (is_internal_whiteout_name(name)) continue;
 
+            /* Track it before exposing it. */
             int add_res = seen_add(&seen, name);
             if (add_res != 0) {
                 closedir(dp);
@@ -193,22 +226,25 @@ int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                 return add_res;
             }
 
+            /* If filler returns non-zero, the buffer is full: stop. */
             if (fill_dir(buf, filler, name) != 0) break;
         }
 
         int saved_errno = errno;
         closedir(dp);
         if (saved_errno != 0) {
+            /* readdir() error */
             seen_free(&seen);
             return -saved_errno;
         }
     } else if (errno != ENOENT && errno != ENOTDIR) {
+        /* If upper dir doesn't exist, that's fine. Other errors should fail. */
         int err = -errno;
         seen_free(&seen);
         return err;
     }
 
-    /* 2) Lower layer entries that are not shadowed or whiteout'd. */
+    /* 2) Add entries from lower layer that are not shadowed. */
     dp = opendir(lower_dir_path);
     if (dp != NULL) {
         errno = 0;
@@ -217,8 +253,11 @@ int unionfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             const char *name = de->d_name;
 
             if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+
+            /* Skip if upper already provided it. */
             if (seen_contains(&seen, name)) continue;
 
+            /* Skip if a whiteout exists in upper for this name. */
             char wh_path[UNIONFS_PATH_MAX];
             build_whiteout_path(wh_path, state, path, name);
             if (access(wh_path, F_OK) == 0) continue;

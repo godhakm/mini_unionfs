@@ -9,6 +9,8 @@
  *
  * Returns 0 on success, negative errno on failure.
  * ---------------------------------------------------------------- */
+/* FUSE3: getattr includes a fuse_file_info* argument. */
+#if MINI_UNIONFS_FUSE3
 int unionfs_getattr(const char *path, struct stat *stbuf,
                     struct fuse_file_info *fi)
 {
@@ -41,6 +43,32 @@ int unionfs_getattr(const char *path, struct stat *stbuf,
 
     return 0;
 }
+#else
+/* FUSE2 (macFUSE): getattr has no fuse_file_info* argument. */
+int unionfs_getattr(const char *path, struct stat *stbuf)
+{
+    char resolved[UNIONFS_PATH_MAX];
+
+    if (strcmp(path, "/") == 0) {
+        memset(stbuf, 0, sizeof(struct stat));
+        stbuf->st_mode  = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+        return 0;
+    }
+
+    int res = resolve_path(path, resolved);
+    if (res != 0) {
+        return res;
+    }
+
+    memset(stbuf, 0, sizeof(struct stat));
+    if (lstat(resolved, stbuf) == -1) {
+        return -errno;
+    }
+
+    return 0;
+}
+#endif
 
 /* ----------------------------------------------------------------
  * FUSE operations table.

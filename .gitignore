@@ -1,0 +1,20 @@
+# Build artifacts
+*.o
+mini_unionfs
+
+# Local test/mount directories (not part of source)
+lower/
+upper/
+mnt/
+
+# macOS noise
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Debug symbols
+*.dSYM/
+
+# Editor/IDE
+.vscode/
+.idea/
