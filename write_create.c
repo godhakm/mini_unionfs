@@ -1,5 +1,32 @@
 #include "mini_unionfs.h"
 
+/* --------------------------------------------------------------------------
+ * write_create.c overview
+ *
+ * This module owns every mutating operation:
+ *   • ensure_upper_dir_exists()/ensure_upper_parent_dir() lazily build the
+ *     directory structure in the upper layer so new files have somewhere to go.
+ *   • cow_copy() performs Copy-on-Write when a user edits a file that only
+ *     lives in lower/, duplicating it into upper/ before any write.
+ *   • unionfs_write/create/mkdir/rmdir() funnel all writes into upper/ and
+ *     create whiteouts when removing lower-only entries.
+ *   • unionfs_create_whiteout() drops `.wh.<name>` markers so resolve_path()
+ *     hides the original lower entry.
+ *
+ * Example scenario:
+ *   1. lower/base.txt exists; upper/base.txt does not.
+ *   2. User runs `echo "hi" >> mnt/base.txt`. unionfs_write resolves the
+ *      lower path, calls cow_copy("/base.txt"), copies it into upper/, and
+ *      appends there.
+ *   3. User deletes `mnt/base.txt`. unionfs_rmdir calls unionfs_create_whiteout,
+ *      producing upper/.wh.base.txt so the lower file stays hidden but intact.
+ */
+
+/* ensure_upper_dir_exists()
+ * Example: virtual_dir="shared/subdir" with upper_dir=/layers/upper
+ * creates /layers/upper/shared then /layers/upper/shared/subdir so later
+ * writes to mnt/shared/subdir/... have a valid parent chain.
+ */
 static int ensure_upper_dir_exists(const char *virtual_dir)
 {
     if (virtual_dir == NULL || virtual_dir[0] == '\0') {
@@ -28,6 +55,10 @@ static int ensure_upper_dir_exists(const char *virtual_dir)
     return 0;
 }
 
+/* ensure_upper_parent_dir()
+ * Example: path="/docs/report.txt" -> ensures "/docs" exists inside upper/.
+ * Root-level files like "/foo.txt" have no parent, so we simply return 0.
+ */
 static int ensure_upper_parent_dir(const char *path)
 {
     char tmp[UNIONFS_PATH_MAX];
@@ -43,6 +74,10 @@ static int ensure_upper_parent_dir(const char *path)
     return ensure_upper_dir_exists(tmp);
 }
 
+/* build_upper_path()
+ * Example: upper_dir=/layers/upper, path=/docs/report.txt -> /layers/upper/docs/report.txt.
+ * When path is just "/", we return upper_dir itself.
+ */
 static void build_upper_path(const char *path, char *dst, size_t len)
 {
     struct mini_unionfs_state *state = UNIONFS_DATA;
@@ -53,6 +88,10 @@ static void build_upper_path(const char *path, char *dst, size_t len)
     }
 }
 
+/* cow_copy()
+ * Example: user edits mnt/base.txt but only lower/base.txt exists. We copy
+ * lower/base.txt -> upper/base.txt byte-for-byte so future writes go to upper/.
+ */
 static int cow_copy(const char *path)
 {
     struct mini_unionfs_state *state = UNIONFS_DATA;
@@ -106,6 +145,11 @@ static int cow_copy(const char *path)
     return 0;
 }
 
+/* unionfs_write()
+ * Example: echo "hi" >> mnt/base.txt -> resolve_path() hits lower/base.txt, so
+ * cow_copy() runs, then we pwrite() "hi" into upper/base.txt at the tail offset.
+ */
+
 int unionfs_write(const char *path, const char *buf, size_t size,
                   off_t offset, struct fuse_file_info *fi)
 {
@@ -142,6 +186,10 @@ int unionfs_write(const char *path, const char *buf, size_t size,
     return (int) bytes;
 }
 
+/* unionfs_create()
+ * Example: touch mnt/custom.txt -> ensure_upper_parent_dir("/custom.txt")
+ * (no-op) then open() creates upper/custom.txt with the requested mode.
+ */
 int unionfs_create(const char *path, mode_t mode,
                    struct fuse_file_info *fi)
 {
@@ -163,6 +211,10 @@ int unionfs_create(const char *path, mode_t mode,
     return 0;
 }
 
+/* unionfs_mkdir()
+ * Example: mkdir -p mnt/projects/demo -> we ensure "/projects" exists in upper/
+ * and create "/projects/demo" there, leaving lower/ untouched.
+ */
 int unionfs_mkdir(const char *path, mode_t mode)
 {
     int res = ensure_upper_parent_dir(path);
@@ -177,6 +229,12 @@ int unionfs_mkdir(const char *path, mode_t mode)
     }
     return 0;
 }
+
+
+/* unionfs_create_whiteout()
+ * Example: deleting mnt/delete_me.txt that only lives in lower/. We create
+ * upper/.wh.delete_me.txt so resolve_path() treats the lower file as removed.
+ */
 
 int unionfs_create_whiteout(const char *path)
 {
@@ -224,6 +282,11 @@ int unionfs_create_whiteout(const char *path)
     close(fd);
     return 0;
 }
+
+/* unionfs_rmdir()
+ * Example A: mnt/mydir exists in upper/ -> rmdir upper/mydir.
+ * Example B: mnt/shared exists only in lower/ -> create upper/.wh.shared to hide it.
+ */
 
 int unionfs_rmdir(const char *path)
 {
